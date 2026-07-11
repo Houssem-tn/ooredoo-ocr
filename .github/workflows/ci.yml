@@ -163,7 +163,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: ${{ github.event_name == 'schedule' && 0 || 2 }}
+          # Full history, every trigger — see the backend/frontend repos'
+          # identical fix for why depth: 2 isn't safe: gitleaks-action
+          # diffs <before-sha>^..<after-sha>, and a push containing more
+          # than one new commit needs <before-sha>'s parent resolvable too.
+          fetch-depth: 0
 
       - name: Run Gitleaks
         uses: gitleaks/gitleaks-action@v2
@@ -230,7 +234,7 @@ jobs:
           retention-days: 30
 
       - name: Trivy scan — fail on Critical
-        uses: aquasecurity/trivy-action@0.28.0
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_OWNER }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.version }}
           severity: CRITICAL
@@ -239,7 +243,7 @@ jobs:
 
       - name: Trivy scan — report High (non-blocking, SARIF upload)
         if: always()
-        uses: aquasecurity/trivy-action@0.28.0
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_OWNER }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.version }}
           severity: HIGH,CRITICAL
