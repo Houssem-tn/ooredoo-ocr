@@ -1,9 +1,16 @@
 #!/usr/bin/env bash
 # Reproduces .github/workflows/ci.yml's `validate` job locally — same
 # ruff/pytest commands CI runs, no separate logic to keep in sync.
-# Run from an activated venv (see README.md), or point PYTHON at one:
+# Run from an activated venv with requirements.txt + ruff + pytest + httpx
+# installed (see README.md), or point PYTHON at one:
 #
 # Usage: ./scripts/ci-local.sh   (PYTHON=venv/Scripts/python ./scripts/ci-local.sh on Windows)
+#
+# httpx is required for the import/startup smoke test below
+# (fastapi.testclient.TestClient needs it) even though it's not a runtime
+# dependency — this bit CI on its first real run (missing from the
+# workflow's own pip install list, since local testing had it installed
+# incidentally via an unrelated `pip install fastapi[all]`).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
