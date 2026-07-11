@@ -1,0 +1,13 @@
+# Pinned to what's actually verified working in venv/ (pip freeze) as of
+# this Docker containerization pass. torch/torchvision are installed
+# separately in the Dockerfile from the PyTorch CPU-only index — this app
+# always runs gpu=False (see app/ocr_engine.py), so the default PyPI torch
+# wheel (which bundles CUDA on Linux) would cost ~1-2GB of unused image
+# size for nothing.
+fastapi==0.136.1
+uvicorn[standard]==0.46.0
+python-multipart==0.0.26
+easyocr==1.7.2
+opencv-python-headless==4.13.0.92
+numpy==2.2.6
+pydantic==2.13.3

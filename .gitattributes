@@ -1,0 +1,4 @@
+# Shell scripts run on Linux CI runners (GitHub Actions) — must stay LF
+# regardless of a contributor's local core.autocrlf setting, or the runner
+# sees "$'\r': command not found" / bad-interpreter failures.
+*.sh text eol=lf

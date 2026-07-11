@@ -1,0 +1,32 @@
+# This directory has no .git yet — kept here anyway in case one is added
+# later.
+.git
+.gitignore
+
+# Local virtualenv — never copy a host-built venv into the image; the
+# Dockerfile builds its own from requirements.txt.
+venv/
+
+# Runtime/temp artifacts
+temp_uploads/
+__pycache__/
+**/__pycache__/
+*.pyc
+.pytest_cache/
+**/.pytest_cache/
+
+# IDE / editor
+.vscode
+.idea
+
+# Docs / images not needed at build time (README screenshots only — app/
+# has no image assets of its own)
+README.md
+DOCKER.md
+*.PNG
+*.png
+
+# Secrets / local env
+.env
+.env.*
+!.env.example

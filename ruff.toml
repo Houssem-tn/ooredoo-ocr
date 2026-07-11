@@ -1,0 +1,16 @@
+# Lightweight, fast Python linter — added for CI since no linter existed
+# before. Deliberately using ruff's default rule set (pyflakes-equivalent:
+# unused imports/variables, undefined names, ambiguous identifiers) rather
+# than opting into ruff's much larger stricter rule catalog — this is a
+# clean codebase with zero pre-existing debt (see CI.md), so start
+# blocking-by-default at a sane baseline rather than a maximal one that
+# would need its own legacy-baseline mechanism on day one.
+target-version = "py310"
+line-length = 100
+
+exclude = [
+    "venv",
+    ".venv",
+    "temp_uploads",
+    "__pycache__",
+]

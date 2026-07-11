@@ -1,0 +1,276 @@
+name: OCR CI
+
+# NOTE: this directory is not currently a git repository with a GitHub
+# remote (confirmed at authoring time: `git remote -v` fails here). This
+# workflow is authored and ready but CANNOT run until this directory is
+# pushed to a GitHub repo of its own — see CI.md at the Pfe/ repo root,
+# "Repository settings I must configure manually".
+#
+# Branch behavior once hosted:
+#   feature/*, fix/*, PRs into develop  -> validation only (no image push)
+#   push to develop                     -> validation + image build + push (develop/sha tags)
+#   push to main                        -> validation + image build + push (latest/version/sha tags)
+on:
+  push:
+    branches: [main, develop]
+    tags: ["v*.*.*"]
+  pull_request:
+    branches: [develop, main]
+  workflow_dispatch: {}
+  schedule:
+    - cron: "0 3 * * 1"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ocr-ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+env:
+  PYTHON_VERSION: "3.10"
+  IMAGE_NAME: ooredoo-ocr
+  REGISTRY: ghcr.io
+
+jobs:
+  # ===========================================================================
+  env-validate:
+    name: Environment validation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Required files exist
+        run: |
+          set -euo pipefail
+          for f in requirements.txt Dockerfile .dockerignore ruff.toml \
+                   app/main.py app/ocr_engine.py app/utils.py app/parser.py; do
+            if [ ! -e "$f" ]; then
+              echo "::error::Required file missing: $f"
+              exit 1
+            fi
+          done
+
+      - name: requirements.txt is fully pinned
+        run: |
+          set -euo pipefail
+          unpinned=$(grep -vE '^\s*#|^\s*$' requirements.txt | grep -vE '==' || true)
+          if [ -n "$unpinned" ]; then
+            echo "::error::Unpinned dependency line(s) in requirements.txt:"
+            echo "$unpinned"
+            exit 1
+          fi
+
+      - name: No .env files tracked
+        run: |
+          set -euo pipefail
+          bad=$(git ls-files | grep -E '(^|/)\.env(\.[A-Za-z0-9_.-]+)?$' | grep -v '\.env\.example$' || true)
+          if [ -n "$bad" ]; then
+            echo "::error::Tracked .env file(s) found (should be git-ignored):"
+            echo "$bad"
+            exit 1
+          fi
+
+      - name: No unresolved merge-conflict markers
+        run: |
+          set -euo pipefail
+          hits=$(git grep -nE '^(<{7}|={7}|>{7})( |$)' -- . ':!*.md' || true)
+          if [ -n "$hits" ]; then
+            echo "::error::Unresolved merge-conflict markers found:"
+            echo "$hits"
+            exit 1
+          fi
+
+  # ===========================================================================
+  validate:
+    name: Lint, test, import-check
+    needs: [env-validate]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: "pip"
+          cache-dependency-path: requirements.txt
+
+      - name: Install system libs (opencv/torch runtime deps)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libgl1 libglib2.0-0 libgomp1
+
+      # Mirrors the Dockerfile's own install order: CPU-only torch/torchvision
+      # first (the default PyPI wheel bundles CUDA on Linux — multi-GB, and
+      # this app always runs gpu=False), then the rest of requirements.txt,
+      # which is then satisfied by the already-installed CPU build.
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install --extra-index-url https://download.pytorch.org/whl/cpu torch==2.11.0 torchvision==0.26.0
+          pip install -r requirements.txt
+          pip install ruff==0.15.21 pytest==9.0.3
+
+      - name: Lint (ruff)
+        run: ruff check app/ tests/ --config ruff.toml --output-format=github
+
+      - name: Tests
+        run: pytest tests/ -q --junitxml=pytest-report.xml
+
+      - name: Import / startup smoke test
+        # Deliberately does NOT download real EasyOCR model weights here —
+        # mirrors tests/test_en_first_fallback.py's own technique
+        # (easyocr.Reader patched out) so this stays fast and network-free.
+        # The REAL model-loaded startup is exercised once, for real, by the
+        # Docker image build below (models are baked in at build time — see
+        # Dockerfile) and by that image's own HEALTHCHECK at container run
+        # time — not re-downloaded on every CI run (see Dockerfile comments
+        # on EASYOCR_MODULE_PATH).
+        run: |
+          python -c "
+          from unittest.mock import patch
+          from fastapi.testclient import TestClient
+
+          with patch('easyocr.Reader'):
+              from app.main import app
+
+          client = TestClient(app)
+          resp = client.get('/')
+          assert resp.status_code == 200, resp.text
+          body = resp.json()
+          assert body['status'] == 'running', body
+          print('Import + startup smoke test OK:', body)
+          "
+
+      - name: Upload pytest report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ocr-test-report
+          path: pytest-report.xml
+          retention-days: 14
+          if-no-files-found: ignore
+
+  # ===========================================================================
+  gitleaks:
+    name: Secret scan (Gitleaks)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: ${{ github.event_name == 'schedule' && 0 || 2 }}
+
+      - name: Run Gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        # No custom .gitleaks.toml here — default ruleset only. No secrets
+        # have ever been found in this directory (verified locally with
+        # `gitleaks detect --no-git` before this workflow was written).
+
+  # ===========================================================================
+  docker:
+    name: Docker build, scan, (push)
+    needs: [validate, gitleaks]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      security-events: write
+    steps:
+      - uses: actions/checkout@v4
+
+      # Registry image references must be lowercase; github.repository_owner
+      # is not guaranteed to be (e.g. "Houssem-tn") — compute it explicitly
+      # rather than relying only on docker/metadata-action's own normalization.
+      - name: Compute lowercase image owner
+        run: echo "IMAGE_OWNER=${GITHUB_REPOSITORY_OWNER,,}" >> "$GITHUB_ENV"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Derive image metadata (tags + labels)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_OWNER }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=sha,prefix=sha-,format=short
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build image (bakes EasyOCR model weights in — see Dockerfile)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          load: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=ocr
+          cache-to: type=gha,mode=max,scope=ocr
+
+      - name: Generate SBOM (CycloneDX)
+        uses: anchore/sbom-action@v0
+        with:
+          image: ${{ env.REGISTRY }}/${{ env.IMAGE_OWNER }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.version }}
+          format: cyclonedx-json
+          output-file: sbom-ocr.cyclonedx.json
+          upload-artifact: false
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ocr-sbom
+          path: sbom-ocr.cyclonedx.json
+          retention-days: 30
+
+      - name: Trivy scan — fail on Critical
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_OWNER }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.version }}
+          severity: CRITICAL
+          exit-code: "1"
+          ignore-unfixed: true
+
+      - name: Trivy scan — report High (non-blocking, SARIF upload)
+        if: always()
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_OWNER }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.version }}
+          severity: HIGH,CRITICAL
+          exit-code: "0"
+          ignore-unfixed: true
+          format: sarif
+          output: trivy-ocr.sarif
+
+      - name: Upload Trivy SARIF
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-ocr.sarif
+        continue-on-error: true
+
+      - name: Log in to ${{ env.REGISTRY }}
+        if: |
+          github.event_name != 'pull_request' &&
+          (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop' || startsWith(github.ref, 'refs/tags/v'))
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push image
+        if: |
+          github.event_name != 'pull_request' &&
+          (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop' || startsWith(github.ref, 'refs/tags/v'))
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=ocr
+          cache-to: type=gha,mode=max,scope=ocr
