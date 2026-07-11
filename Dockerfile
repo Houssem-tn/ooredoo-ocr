@@ -70,7 +70,14 @@ easyocr.Reader(['ar', 'en'], gpu=False, detector=False, download_enabled=True)"
 ############################################
 FROM python:3.10-slim AS runtime
 
+# apt-get upgrade pulls whatever security patches are current at build
+# time for packages already in the base image — the 3.10-slim tag is a
+# moving tag, not rebuilt every time an upstream package gets patched
+# (confirmed in practice on the sibling frontend image's Alpine base: a
+# freshly-pulled image still had an already-fixed OpenSSL CVE — see
+# Pfe-Oreedoo-Front/Dockerfile).
 RUN apt-get update \
+    && apt-get upgrade -y \
     && apt-get install -y --no-install-recommends \
         libgl1 \
         libglib2.0-0 \
