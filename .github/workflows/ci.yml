@@ -160,6 +160,14 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+      # gitleaks-action calls the GitHub API to list the PR's commits on
+      # `pull_request` events (to know what range to scan); without this,
+      # that call 403s ("Resource not accessible by integration") and the
+      # job fails before it ever runs a scan — not a secret finding, a
+      # missing scope. `push` events don't need this (found 2026-07-24,
+      # the first pull_request-triggered run in a while to actually
+      # exercise this path).
+      pull-requests: read
     steps:
       - uses: actions/checkout@v4
         with:
