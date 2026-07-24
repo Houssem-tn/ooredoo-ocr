@@ -1,13 +1,30 @@
+import time
 from typing import Any, Dict, List, Optional
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import Response
+from starlette.middleware.base import BaseHTTPMiddleware
 
-from app.ocr_engine import ocr_engine
-from app.parser import detect_document_type, extract_structured_data
-from app.schemas import BatchExtractResponse
-from app.utils import delete_file_safely, save_temp_file
+from app.logging_config import configure_logging, logger
 
+# Must run before importing app.ocr_engine: that import instantiates
+# EasyOCREngine() at module load time (see ocr_engine.py's bottom line),
+# which logs as it loads each model — without this, those log calls would
+# hit the default, unconfigured root logger (no handler, INFO dropped)
+# instead of the real JSON/plain handler set up below.
+configure_logging()
+
+from app.metrics import (  # noqa: E402
+    ocr_active_requests,
+    ocr_request_duration_seconds,
+    ocr_requests_total,
+)
+from app.ocr_engine import ocr_engine  # noqa: E402
+from app.parser import detect_document_type, extract_structured_data  # noqa: E402
+from app.request_context import get_request_id, new_request_id, set_request_id  # noqa: E402
+from app.schemas import BatchExtractResponse  # noqa: E402
+from app.utils import delete_file_safely, save_temp_file  # noqa: E402
 
 app = FastAPI(
     title="EasyOCR Telecom Extraction API",
@@ -24,32 +41,81 @@ app.add_middleware(
 )
 
 
-def extract(image_path: str) -> dict:
-    ocr_result = ocr_engine.extract_best(image_path)
+class RequestIdMiddleware(BaseHTTPMiddleware):
+    """Accepts the caller's X-Request-ID (the backend's OcrClientService
+    forwards the one it received from nginx/the client — see
+    OBSERVABILITY_BACKUP.md "Correlation IDs") or mints one, makes it
+    available to app.logging_config's log filter for the duration of the
+    request, and echoes it back so the caller can confirm what OCR itself
+    logged the request under.
+    """
 
-    best = ocr_result["best"]
+    async def dispatch(self, request: Request, call_next):
+        incoming = request.headers.get("x-request-id")
+        set_request_id(incoming or new_request_id())
+        response = await call_next(request)
+        response.headers["X-Request-ID"] = get_request_id()
+        return response
 
-    raw_text = best["raw_text"]
-    ocr_items = best["items"]
 
-    # extract_best pre-parses each pass (and, for router screens, merges the
-    # EN and AR+EN passes per field) — re-parsing raw_text here would lose
-    # the merge.
-    extracted_data = best.get("structured")
-    if extracted_data is None:
-        extracted_data = extract_structured_data(
-            raw_text,
-            ocr_items=ocr_items,
-            include_confidence=True,
-        )
+app.add_middleware(RequestIdMiddleware)
 
-    return {
-        "raw_ocr_text": raw_text,
-        "extracted_data": extracted_data,
-        "ocr_pass": best["variant"],
-        "ocr_confidence": best["avg_confidence"],
-        "ocr_passes": ocr_result["passes"],
-    }
+
+@app.get("/metrics")
+def metrics():
+    # Internal-only — see app/metrics.py's own module docstring for why
+    # this is safe to leave unauthenticated (never reachable outside the
+    # cluster; the OCR Kubernetes Service is ClusterIP-only and the
+    # Ingress never references it).
+    from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
+
+    return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
+
+
+def extract(image_path: str, endpoint: str = "extract") -> dict:
+    """Shared OCR core for /extract, /extract/debug, and each file inside
+    /extract/batch — metrics (request count, duration, active-in-flight)
+    are recorded here once, rather than duplicated at each of those three
+    call sites, since they all funnel through this one function.
+    """
+    ocr_active_requests.inc()
+    started = time.monotonic()
+    try:
+        ocr_result = ocr_engine.extract_best(image_path)
+
+        best = ocr_result["best"]
+
+        raw_text = best["raw_text"]
+        ocr_items = best["items"]
+
+        # extract_best pre-parses each pass (and, for router screens, merges
+        # the EN and AR+EN passes per field) — re-parsing raw_text here
+        # would lose the merge.
+        extracted_data = best.get("structured")
+        if extracted_data is None:
+            extracted_data = extract_structured_data(
+                raw_text,
+                ocr_items=ocr_items,
+                include_confidence=True,
+            )
+
+        ocr_requests_total.labels(endpoint=endpoint, status="success").inc()
+        return {
+            "raw_ocr_text": raw_text,
+            "extracted_data": extracted_data,
+            "ocr_pass": best["variant"],
+            "ocr_confidence": best["avg_confidence"],
+            "ocr_passes": ocr_result["passes"],
+        }
+    except HTTPException:
+        ocr_requests_total.labels(endpoint=endpoint, status="invalid_input").inc()
+        raise
+    except Exception:
+        ocr_requests_total.labels(endpoint=endpoint, status="failure").inc()
+        raise
+    finally:
+        ocr_request_duration_seconds.labels(endpoint=endpoint).observe(time.monotonic() - started)
+        ocr_active_requests.dec()
 
 
 @app.get("/")
@@ -68,7 +134,7 @@ async def extract_endpoint(file: UploadFile = File(...)):
     try:
         temp_path = await save_temp_file(file)
 
-        result = extract(str(temp_path))
+        result = extract(str(temp_path), endpoint="extract")
 
         raw_text = result["raw_ocr_text"]
         data = result["extracted_data"]
@@ -125,10 +191,10 @@ async def process_single_attachment(file: UploadFile) -> Dict[str, Any]:
         # empty uploads, raising HTTPException on bad input.
         temp_path = await save_temp_file(file)
 
-        result = extract(str(temp_path))
+        result = extract(str(temp_path), endpoint="extract_batch")
         raw_text = result["raw_ocr_text"]
 
-        print(f"[BATCH] SUCCESS file={filename!r} confidence={result['ocr_confidence']}")
+        logger.info("batch item succeeded", extra={"filename": filename, "confidence": result["ocr_confidence"]})
 
         return {
             "filename": filename,
@@ -142,11 +208,11 @@ async def process_single_attachment(file: UploadFile) -> Dict[str, Any]:
         }
 
     except HTTPException as e:
-        print(f"[BATCH] FAILED file={filename!r}: {e.detail}")
+        logger.warning("batch item failed", extra={"filename": filename, "detail": str(e.detail)})
         return _failed_result(filename, str(e.detail))
 
     except Exception as e:
-        print(f"[BATCH] FAILED file={filename!r}: {e}")
+        logger.warning("batch item failed", extra={"filename": filename, "error": str(e)})
         return _failed_result(filename, str(e))
 
     finally:
@@ -164,11 +230,11 @@ async def process_multiple_images(
     A failure on one image is isolated to that image's result.
     """
     total = len(files)
-    print(f"[BATCH] processing {total} image(s) case_id={case_id!r}")
+    logger.info("batch processing started", extra={"total": total, "case_id": case_id})
 
     results: List[Dict[str, Any]] = []
     for index, file in enumerate(files, start=1):
-        print(f"[BATCH] ({index}/{total}) file={file.filename!r}")
+        logger.info("batch item processing", extra={"index": index, "total": total, "filename": file.filename})
         results.append(await process_single_attachment(file))
 
     return results

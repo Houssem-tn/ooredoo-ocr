@@ -8,6 +8,8 @@ import numpy as np
 from easyocr.utils import reformat_input
 from fastapi import HTTPException
 
+from app.logging_config import logger
+from app.metrics import ocr_invalid_input_total, ocr_model_loaded
 from app.parser import (
     extract_structured_data,
     merge_router_results,
@@ -23,11 +25,14 @@ _OCR_TARGET_WIDTH = 1600
 
 class EasyOCREngine:
     def __init__(self):
+        logger.info("loading EasyOCR models")
         self.reader_en = easyocr.Reader(["en"], gpu=False)
         # Recognition-only: detection boxes always come from reader_en
         # (detection is language-agnostic), so this reader never needs
         # its own detection model.
         self.reader_ar_en = easyocr.Reader(["ar", "en"], gpu=False, detector=False)
+        ocr_model_loaded.set(1)
+        logger.info("EasyOCR models loaded")
 
     # ---------------------------------------------------------------
     # Public API
@@ -40,24 +45,26 @@ class EasyOCREngine:
             raise FileNotFoundError(f"Image not found: {image_path}")
 
         file_size = path.stat().st_size
-        print(f"[OCR] file={path.name!r}  size={file_size} bytes")
+        logger.info("processing image", extra={"size_bytes": file_size})
 
         # cv2.imread returns None on Windows for paths with non-ASCII chars
         # or truncated files — fall back to imdecode-from-bytes.
         image = cv2.imread(str(path))
         if image is None:
-            print("[OCR] cv2.imread returned None — trying imdecode fallback")
+            logger.info("cv2.imread returned None, trying imdecode fallback")
             raw = path.read_bytes()
             arr = np.frombuffer(raw, dtype=np.uint8)
             image = cv2.imdecode(arr, cv2.IMREAD_COLOR)
 
         if image is None:
+            ocr_invalid_input_total.labels(reason="unreadable_image").inc()
             raise HTTPException(
                 status_code=400,
                 detail="Invalid or unreadable image file",
             )
 
         if image.size == 0 or len(image.shape) < 2:
+            ocr_invalid_input_total.labels(reason="empty_or_corrupted_image").inc()
             raise HTTPException(
                 status_code=400,
                 detail="Uploaded image is empty or corrupted",
@@ -67,7 +74,7 @@ class EasyOCREngine:
         # This is the primary speed fix: a 4000px phone photo becomes 1600px,
         # reducing pixel count by ~6x and OCR time from 2 min to ~15 s on CPU.
         image = self._normalize_size(image)
-        print(f"[OCR] normalized shape={image.shape}")
+        logger.debug("normalized image", extra={"shape": str(image.shape)})
 
         # Detect text boxes once — detection (CRAFT) is language-agnostic.
         # Only recognition differs per language, so both passes share boxes.
@@ -108,12 +115,12 @@ class EasyOCREngine:
         if structured.get("type") != "router_signal_screen" or router_critical_fields_valid(structured):
             # Equipment labels and speedtests never use the Arabic reader, and
             # a router screen the EN pass read completely doesn't need it either.
-            print("[OCR] en pass sufficient — skipping ar+en pass")
+            logger.debug("en pass sufficient, skipping ar+en pass")
             return {"best": en_pass, "passes": [en_pass]}
 
         # AR+EN fallback: critical fields are missing — recognize the SAME
         # boxes with the Arabic+English model and fill only the gaps.
-        print("[OCR] critical fields missing in en pass — running ar+en fallback")
+        logger.debug("critical fields missing in en pass, running ar+en fallback")
         ar_items, ar_text, ar_confidence = self._recognize(
             self.reader_ar_en, img_grey, horizontal_list, free_list
         )

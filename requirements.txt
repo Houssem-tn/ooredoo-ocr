@@ -11,3 +11,6 @@ easyocr==1.7.2
 opencv-python-headless==4.13.0.92
 numpy==2.2.6
 pydantic==2.13.3
+# /metrics endpoint (internal-only — see K8s Service, never Ingressed) for
+# Prometheus scraping. See app/metrics.py.
+prometheus-client==0.25.0
