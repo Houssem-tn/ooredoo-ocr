@@ -6,7 +6,7 @@
 # size for nothing.
 fastapi==0.136.1
 uvicorn[standard]==0.46.0
-python-multipart==0.0.26
+python-multipart==0.0.30
 easyocr==1.7.2
 opencv-python-headless==4.13.0.92
 numpy==2.2.6
