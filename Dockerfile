@@ -76,7 +76,8 @@ FROM python:3.10-slim AS runtime
 # (confirmed in practice on the sibling frontend image's Alpine base: a
 # freshly-pulled image still had an already-fixed OpenSSL CVE — see
 # Pfe-Oreedoo-Front/Dockerfile).
-RUN apt-get update \
+RUN export DEBIAN_FRONTEND=noninteractive \
+    && apt-get update \
     && apt-get upgrade -y \
     && apt-get install -y --no-install-recommends \
         libgl1 \

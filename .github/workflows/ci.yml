@@ -160,6 +160,14 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+      # gitleaks-action calls the GitHub API to list the PR's commits on
+      # `pull_request` events (to know what range to scan); without this,
+      # that call 403s ("Resource not accessible by integration") and the
+      # job fails before it ever runs a scan — not a secret finding, a
+      # missing scope. `push` events don't need this (found 2026-07-24,
+      # the first pull_request-triggered run in a while to actually
+      # exercise this path).
+      pull-requests: read
     steps:
       - uses: actions/checkout@v4
         with:
@@ -259,10 +267,15 @@ jobs:
           sarif_file: trivy-ocr.sarif
         continue-on-error: true
 
+      # workflow_dispatch is included alongside develop/main/tags so a
+      # trusted, manually-triggered release build (e.g. the Phase 5 release
+      # orchestrator in the backend repo) can publish an immutable image
+      # from any branch — see the backend repo's ci.yml for the full
+      # rationale (same pattern, applied identically here for consistency).
       - name: Log in to ${{ env.REGISTRY }}
         if: |
           github.event_name != 'pull_request' &&
-          (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop' || startsWith(github.ref, 'refs/tags/v'))
+          (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop' || startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch')
         uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
@@ -270,9 +283,10 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Push image
+        id: push
         if: |
           github.event_name != 'pull_request' &&
-          (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop' || startsWith(github.ref, 'refs/tags/v'))
+          (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop' || startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch')
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -281,3 +295,28 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha,scope=ocr
           cache-to: type=gha,mode=max,scope=ocr
+
+      - name: Record published image reference
+        if: steps.push.outcome == 'success'
+        run: |
+          mkdir -p image-info
+          cat > image-info/ocr.json <<JSON
+          {
+            "component": "ocr",
+            "repository": "${{ env.REGISTRY }}/${{ env.IMAGE_OWNER }}/${{ env.IMAGE_NAME }}",
+            "sourceRepository": "${{ github.repository }}",
+            "sourceSha": "${{ github.sha }}",
+            "tags": ${{ toJSON(steps.meta.outputs.tags) }},
+            "digest": "${{ steps.push.outputs.digest }}",
+            "workflowRunId": "${{ github.run_id }}"
+          }
+          JSON
+          cat image-info/ocr.json
+
+      - name: Upload image reference
+        if: steps.push.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ocr-image-info
+          path: image-info/ocr.json
+          retention-days: 90
